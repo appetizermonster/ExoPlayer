@@ -49,6 +49,7 @@ cmake-build-debug
 dist
 jacoco.exec
 tmp
+.cxx
 
 # External native builds
 .externalNativeBuild
