@@ -63,6 +63,7 @@ import com.google.android.gms.cast.framework.media.RemoteMediaClient.MediaChanne
 import com.google.android.gms.common.api.PendingResult;
 import com.google.android.gms.common.api.ResultCallback;
 import com.google.common.collect.ImmutableList;
+import java.util.ArrayList;
 import java.util.List;
 import org.checkerframework.checker.nullness.qual.RequiresNonNull;
 
@@ -284,6 +285,13 @@ public final class CastPlayer extends BasePlayer {
   @Override
   public void removeListener(Listener listener) {
     listeners.remove(listener);
+  }
+
+  @Nullable
+  public PendingResult<MediaChannelResult> loadMediaItem(MediaItem mediaItem, long startPositionMs) {
+    List<MediaItem> mediaItems = new ArrayList<MediaItem>();
+    mediaItems.add(mediaItem);
+    return setMediaItemsInternal(mediaItems, /* startIndex= */ 0, startPositionMs, repeatMode.value);
   }
 
   @Override
@@ -1090,13 +1098,14 @@ public final class CastPlayer extends BasePlayer {
     }
   }
 
-  private void setMediaItemsInternal(
+  @Nullable
+  private PendingResult<MediaChannelResult> setMediaItemsInternal(
       List<MediaItem> mediaItems,
       int startIndex,
       long startPositionMs,
       @RepeatMode int repeatMode) {
     if (remoteMediaClient == null || mediaItems.isEmpty()) {
-      return;
+      return null;
     }
     startPositionMs = startPositionMs == C.TIME_UNSET ? 0 : startPositionMs;
     if (startIndex == C.INDEX_UNSET) {
@@ -1109,7 +1118,7 @@ public final class CastPlayer extends BasePlayer {
     }
     MediaQueueItem[] mediaQueueItems = toMediaQueueItems(mediaItems);
     timelineTracker.onMediaItemsSet(mediaItems, mediaQueueItems);
-    remoteMediaClient.queueLoad(
+    return remoteMediaClient.queueLoad(
         mediaQueueItems,
         min(startIndex, mediaItems.size() - 1),
         getCastRepeatMode(repeatMode),
