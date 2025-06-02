@@ -3,6 +3,7 @@ package com.google.android.exoplayer2.ext.ffmpeg;
 import androidx.annotation.Nullable;
 import com.google.android.exoplayer2.C;
 import com.google.android.exoplayer2.Format;
+import com.google.android.exoplayer2.ParserException;
 import com.google.android.exoplayer2.extractor.Extractor;
 import com.google.android.exoplayer2.extractor.ExtractorInput;
 import com.google.android.exoplayer2.extractor.ExtractorOutput;
@@ -38,7 +39,6 @@ public final class FfmpegExtractor implements Extractor {
   private final byte[] packetBuffer;
   private final long[] timestampBuffer;
   private boolean endOfInput;
-  private FfmpegSeekMap seekMap;
 
   public FfmpegExtractor() throws FfmpegDecoderException {
     if (!FfmpegLibrary.isAvailable()) {
@@ -97,7 +97,8 @@ public final class FfmpegExtractor implements Extractor {
         nativeContext = nativeCreateContext(inputData, inputLength);
         if (nativeContext == 0) {
           Log.e(TAG, "Failed to create native context");
-          return RESULT_END_OF_INPUT;
+          throw ParserException.createForMalformedContainer("Failed to create native context",
+              null);
         }
       }
 
@@ -113,7 +114,7 @@ public final class FfmpegExtractor implements Extractor {
     }
   }
 
-  private void initializeTracks() {
+  private void initializeTracks() throws ParserException {
     int codecId = nativeGetAudioCodecId(nativeContext);
     int sampleRate = nativeGetSampleRate(nativeContext);
     int channelCount = nativeGetChannelCount(nativeContext);
@@ -124,7 +125,7 @@ public final class FfmpegExtractor implements Extractor {
     String mimeType = getMimeTypeFromCodecId(codecId);
     if (mimeType == null) {
       Log.e(TAG, "Unsupported codec ID: " + codecId);
-      return;
+      throw ParserException.createForMalformedContainer("Unsupported codec ID: " + codecId, null);
     }
 
     Format.Builder formatBuilder = new Format.Builder()
@@ -161,8 +162,7 @@ public final class FfmpegExtractor implements Extractor {
       durationUs = C.TIME_UNSET;
     }
 
-    seekMap = new FfmpegSeekMap(durationUs);
-    extractorOutput.seekMap(seekMap);
+    extractorOutput.seekMap(new FfmpegSeekMap(durationUs));
 
     Log.d(TAG, String.format("SeekMap initialized - Duration: %d us", durationUs));
     Log.d(TAG,
@@ -181,7 +181,7 @@ public final class FfmpegExtractor implements Extractor {
     }
   }
 
-  private int readSample() throws IOException {
+  private int readSample() {
     // FFmpeg demuxer will handle reading directly from ExtractorInput
     // through the sliding buffer AVIO context
     timestampBuffer[0] = C.TIME_UNSET;
@@ -215,8 +215,10 @@ public final class FfmpegExtractor implements Extractor {
   @Override
   public void seek(long position, long timeUs) {
     Log.d(TAG, "seek: position: " + position + ", timeUs: " + timeUs);
-    nativeSeek(nativeContext, timeUs);
-    endOfInput = false;
+    if (nativeContext != 0) {
+      nativeSeek(nativeContext, timeUs);
+      endOfInput = false;
+    }
   }
 
   @Override

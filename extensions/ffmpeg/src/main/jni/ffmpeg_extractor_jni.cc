@@ -50,8 +50,8 @@ struct InputWrapper {
 
 struct FfmpegDemuxContext {
   AVFormatContext *format_ctx;
-  AVIOContext *avio_ctx;
   uint8_t *avio_buffer;
+  AVIOContext *avio_ctx;
   int audio_stream_index;
   AVStream *audio_stream;
   InputWrapper *input_wrapper;
@@ -153,13 +153,12 @@ static void demux_context_free(FfmpegDemuxContext *ctx) {
     avformat_close_input(&ctx->format_ctx);
   }
 
-  if (ctx->avio_ctx) {
-    av_freep(&ctx->avio_ctx->buffer);
-    av_freep(&ctx->avio_ctx);
+  if (ctx->avio_buffer) {
+    av_freep(&ctx->avio_buffer);
   }
 
-  if (ctx->avio_buffer) {
-    av_free(ctx->avio_buffer);
+  if (ctx->avio_ctx) {
+    avio_context_free(&ctx->avio_ctx);
   }
 
   if (ctx->input_wrapper) {
@@ -182,6 +181,7 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
     return 0L;
   }
 
+  ctx->audio_stream_index = -1;
   ctx->input_wrapper = (InputWrapper *) calloc(1, sizeof(InputWrapper));
   if (!ctx->input_wrapper) {
     LOGE("Failed to allocate InputWrapper");
@@ -189,18 +189,16 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
     return 0L;
   }
 
-  ctx->avio_buffer = (uint8_t *) av_malloc(AVIO_BUFFER_SIZE);
-  if (!ctx->avio_buffer) {
-    LOGE("Failed to allocate AVIO buffer");
+  // Initialize input wrapper
+  if (input_wrapper_init(ctx->input_wrapper, env, inputData, inputLength) < 0) {
+    LOGE("Failed to initialize input wrapper");
     demux_context_free(ctx);
     return 0L;
   }
 
-  ctx->audio_stream_index = -1;
-
-  // Initialize input wrapper
-  if (input_wrapper_init(ctx->input_wrapper, env, inputData, inputLength) < 0) {
-    LOGE("Failed to initialize input wrapper");
+  ctx->avio_buffer = (uint8_t *) av_malloc(AVIO_BUFFER_SIZE);
+  if (!ctx->avio_buffer) {
+    LOGE("Failed to allocate AVIO buffer");
     demux_context_free(ctx);
     return 0L;
   }
@@ -229,8 +227,9 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
     return 0L;
   }
 
-  ctx->format_ctx->format_probesize = 64 * 1024;
+  ctx->format_ctx->format_probesize = 64 * 1024; // 64KB
   ctx->format_ctx->pb = ctx->avio_ctx;
+  ctx->format_ctx->flags |= AVFMT_FLAG_CUSTOM_IO;
 
   // Open input
   LOGD("Opening input, skip_initial_bytes: %lld, format_probesize: %d",
