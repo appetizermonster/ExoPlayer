@@ -73,8 +73,9 @@ import java.util.List;
     extraData = getExtraData(format.sampleMimeType, format.initializationData);
     encoding = outputFloat ? C.ENCODING_PCM_FLOAT : C.ENCODING_PCM_16BIT;
     outputBufferSize = outputFloat ? OUTPUT_BUFFER_SIZE_32BIT : OUTPUT_BUFFER_SIZE_16BIT;
+    int blockAlign = getBlockAlign(format.sampleMimeType, format.initializationData);
     nativeContext =
-        ffmpegInitialize(codecName, extraData, outputFloat, format.sampleRate, format.channelCount);
+        ffmpegInitialize(codecName, extraData, outputFloat, format.sampleRate, format.channelCount, format.bitrate, blockAlign);
     if (nativeContext == 0) {
       throw new FfmpegDecoderException("Initialization failed.");
     }
@@ -184,6 +185,8 @@ import java.util.List;
         return getAlacExtraData(initializationData);
       case MimeTypes.AUDIO_VORBIS:
         return getVorbisExtraData(initializationData);
+      case MimeTypes.AUDIO_WMA:
+        return getWmaExtraData(initializationData);
       default:
         // Other codecs do not require extra data.
         return null;
@@ -221,12 +224,42 @@ import java.util.List;
     return extraData;
   }
 
+  private static @Nullable byte[] getWmaExtraData(List<byte[]> initializationData) {
+    // WMA codec requires only the codec private data, not the full WAVEFORMATEX
+    if (initializationData.isEmpty()) {
+      return null;
+    }
+    
+    // Return the codec private data directly
+    return initializationData.get(0);
+  }
+
+  /**
+   * Extracts the block align value for WMA codecs from initialization data.
+   * For WMA, this information needs to be passed separately to FFmpeg.
+   */
+  private static int getBlockAlign(String mimeType, List<byte[]> initializationData) {
+    if (!MimeTypes.AUDIO_WMA.equals(mimeType) || initializationData.size() < 2) {
+      return Format.NO_VALUE;
+    }
+
+    byte[] blob = initializationData.get(1);
+    if (blob == null || blob.length < 2) {
+      return Format.NO_VALUE;
+    }
+
+    // Always read the first two bytes as a little-endian unsigned short.
+    return (blob[0] & 0xFF) | ((blob[1] & 0xFF) << 8);
+  }
+
   private native long ffmpegInitialize(
       String codecName,
       @Nullable byte[] extraData,
       boolean outputFloat,
       int rawSampleRate,
-      int rawChannelCount);
+      int rawChannelCount,
+      int bitRate,
+      int blockAlign);
 
   private native int ffmpegDecode(
       long context, ByteBuffer inputData, int inputSize, ByteBuffer outputData, int outputSize);

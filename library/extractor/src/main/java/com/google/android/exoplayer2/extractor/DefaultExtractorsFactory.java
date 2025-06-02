@@ -82,6 +82,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   <li>JPEG ({@link JpegExtractor})
  *   <li>MIDI, if available, the MIDI extension's {@code
  *       com.google.android.exoplayer2.decoder.midi.MidiExtractor} is used.
+ *   <li>WMA ({@code com.google.android.exoplayer2.ext.ffmpeg.FfmpegExtractor})}
  * </ul>
  *
  * @deprecated com.google.android.exoplayer2 is deprecated. Please migrate to androidx.media3 (which
@@ -116,12 +117,15 @@ public final class DefaultExtractorsFactory implements ExtractorsFactory {
         FileTypes.AVI,
         FileTypes.MIDI,
         FileTypes.JPEG,
+        FileTypes.WMA,
       };
 
   private static final ExtensionLoader FLAC_EXTENSION_LOADER =
       new ExtensionLoader(DefaultExtractorsFactory::getFlacExtractorConstructor);
   private static final ExtensionLoader MIDI_EXTENSION_LOADER =
       new ExtensionLoader(DefaultExtractorsFactory::getMidiExtractorConstructor);
+  private static final ExtensionLoader FFMPEG_EXTENSION_LOADER =
+      new ExtensionLoader(DefaultExtractorsFactory::getFfmpegExtractorConstructor);
 
   private boolean constantBitrateSeekingEnabled;
   private boolean constantBitrateSeekingAlwaysEnabled;
@@ -463,6 +467,12 @@ public final class DefaultExtractorsFactory implements ExtractorsFactory {
       case FileTypes.AVI:
         extractors.add(new AviExtractor());
         break;
+      case FileTypes.WMA:
+        @Nullable Extractor ffmpegExtractor = FFMPEG_EXTENSION_LOADER.getExtractor();
+        if (ffmpegExtractor != null) {
+          extractors.add(ffmpegExtractor);
+        }
+        break;
       case FileTypes.WEBVTT:
       case FileTypes.UNKNOWN:
       default:
@@ -495,6 +505,13 @@ public final class DefaultExtractorsFactory implements ExtractorsFactory {
           .getConstructor(int.class);
     }
     return null;
+  }
+
+  private static Constructor<? extends Extractor> getFfmpegExtractorConstructor()
+      throws ClassNotFoundException, NoSuchMethodException {
+    return Class.forName("com.google.android.exoplayer2.ext.ffmpeg.FfmpegExtractor")
+        .asSubclass(Extractor.class)
+        .getConstructor();
   }
 
   private static final class ExtensionLoader {

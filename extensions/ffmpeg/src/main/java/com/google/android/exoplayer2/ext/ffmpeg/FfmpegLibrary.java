@@ -154,6 +154,8 @@ public final class FfmpegLibrary {
         return "pcm_mulaw";
       case MimeTypes.AUDIO_ALAW:
         return "pcm_alaw";
+      case MimeTypes.AUDIO_WMA:
+        return "wmav2";
       default:
         return null;
     }

@@ -1,5 +1,14 @@
 [
   {
+    "name": "WMA",
+    "samples": [
+      {
+        "name": "Sample 1",
+        "uri": "https://filesamples.com/samples/audio/wma/sample1.wma"
+      }
+    ]
+  },
+  {
     "name": "Clear DASH",
     "samples": [
       {

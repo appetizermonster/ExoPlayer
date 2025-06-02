@@ -37,6 +37,8 @@ COMMON_OPTIONS="
     --disable-symver
     --disable-avresample
     --enable-swresample
+    --enable-avformat
+    --enable-demuxer=asf
     --extra-ldexeflags=-pie
     "
 TOOLCHAIN_PREFIX="${NDK_PATH}/toolchains/llvm/prebuilt/${HOST_PLATFORM}/bin"

@@ -29,6 +29,7 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/opt.h>
+#include <libavutil/log.h>
 #include <libswresample/swresample.h>
 }
 
@@ -78,7 +79,7 @@ AVCodec *getCodecByName(JNIEnv *env, jstring codecName);
  */
 AVCodecContext *createContext(JNIEnv *env, AVCodec *codec, jbyteArray extraData,
                               jboolean outputFloat, jint rawSampleRate,
-                              jint rawChannelCount);
+                              jint rawChannelCount, jint bitRate, jint blockAlign);
 
 /**
  * Decodes the packet into the output buffer, returning the number of bytes
@@ -103,12 +104,41 @@ void logError(const char *functionName, int errorNumber);
  */
 void releaseContext(AVCodecContext *context);
 
+#ifndef NDEBUG
+void ffmpeg_log_callback(void* ptr, int level, const char* fmt, va_list vl) {
+    if (level > av_log_get_level()) {
+        return;
+    }
+
+    int android_log_level = ANDROID_LOG_DEFAULT;
+    if (level <= AV_LOG_ERROR) {
+        android_log_level = ANDROID_LOG_ERROR;
+    } else if (level <= AV_LOG_WARNING) {
+        android_log_level = ANDROID_LOG_WARN;
+    } else if (level <= AV_LOG_INFO) {
+        android_log_level = ANDROID_LOG_INFO;
+    } else if (level <= AV_LOG_VERBOSE) {
+        android_log_level = ANDROID_LOG_VERBOSE;
+    } else if (level <= AV_LOG_DEBUG) {
+        android_log_level = ANDROID_LOG_DEBUG;
+    }
+
+    char message[1024]; // Or some other reasonable buffer size
+    vsnprintf(message, sizeof(message), fmt, vl);
+    __android_log_print(android_log_level, LOG_TAG, "%s", message);
+}
+#endif
+
 jint JNI_OnLoad(JavaVM *vm, void *reserved) {
   JNIEnv *env;
   if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
     return -1;
   }
   avcodec_register_all();
+#ifndef NDEBUG
+  av_log_set_callback(ffmpeg_log_callback);
+  av_log_set_level(AV_LOG_VERBOSE);
+#endif
   return JNI_VERSION_1_6;
 }
 
@@ -126,14 +156,14 @@ LIBRARY_FUNC(jboolean, ffmpegHasDecoder, jstring codecName) {
 
 AUDIO_DECODER_FUNC(jlong, ffmpegInitialize, jstring codecName,
                    jbyteArray extraData, jboolean outputFloat,
-                   jint rawSampleRate, jint rawChannelCount) {
+                   jint rawSampleRate, jint rawChannelCount, jint bitRate, jint blockAlign) {
   AVCodec *codec = getCodecByName(env, codecName);
   if (!codec) {
     LOGE("Codec not found.");
     return 0L;
   }
   return (jlong)createContext(env, codec, extraData, outputFloat, rawSampleRate,
-                              rawChannelCount);
+                              rawChannelCount, bitRate, blockAlign);
 }
 
 AUDIO_DECODER_FUNC(jint, ffmpegDecode, jlong context, jobject inputData,
@@ -201,7 +231,9 @@ AUDIO_DECODER_FUNC(jlong, ffmpegReset, jlong jContext, jbyteArray extraData) {
         (jboolean)(context->request_sample_fmt == OUTPUT_FORMAT_PCM_FLOAT);
     return (jlong)createContext(env, codec, extraData, outputFloat,
                                 /* rawSampleRate= */ -1,
-                                /* rawChannelCount= */ -1);
+                                /* rawChannelCount= */ -1,
+                                /* bitRate= */ -1,
+                                /* blockAlign= */ -1);
   }
 
   avcodec_flush_buffers(context);
@@ -226,7 +258,7 @@ AVCodec *getCodecByName(JNIEnv *env, jstring codecName) {
 
 AVCodecContext *createContext(JNIEnv *env, AVCodec *codec, jbyteArray extraData,
                               jboolean outputFloat, jint rawSampleRate,
-                              jint rawChannelCount) {
+                              jint rawChannelCount, jint bitRate, jint blockAlign) {
   AVCodecContext *context = avcodec_alloc_context3(codec);
   if (!context) {
     LOGE("Failed to allocate context.");
@@ -252,6 +284,16 @@ AVCodecContext *createContext(JNIEnv *env, AVCodec *codec, jbyteArray extraData,
     context->channels = rawChannelCount;
     context->channel_layout = av_get_default_channel_layout(rawChannelCount);
   }
+
+  // Set block_align for WMA codecs - required by wmadec.c
+  if (context->codec_id == AV_CODEC_ID_WMAV1 || context->codec_id == AV_CODEC_ID_WMAV2) {
+    context->sample_rate = rawSampleRate;
+    context->channels = rawChannelCount;
+    context->channel_layout = av_get_default_channel_layout(rawChannelCount);
+    context->bit_rate = bitRate;
+    context->block_align = blockAlign;
+  }
+
   context->err_recognition = AV_EF_IGNORE_ERR;
   int result = avcodec_open2(context, codec, NULL);
   if (result < 0) {
