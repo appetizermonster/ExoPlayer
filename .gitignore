@@ -80,3 +80,6 @@ extensions/cronet/libs/*
 
 # MIDI extension
 extensions/midi/lib
+
+# Build outputs
+/outputs/

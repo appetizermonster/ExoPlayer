@@ -1,0 +1,66 @@
+// Copyright (C) 2023 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/**
+ * Configuration for customizing AAR output directory and file naming.
+ * This script configures all library modules to:
+ * 1. Output AAR files to {projectDir}/outputs/
+ * 2. Append version suffix to AAR file names
+ * 3. Precisely copy only the generated AAR for the executed assemble task
+ */
+
+apply from: "$gradle.ext.exoplayerSettingsDir/constants.gradle"
+
+android {
+    libraryVariants.all { variant ->
+        variant.outputs.all { output ->
+            // This part renames the AAR inside the module's build/outputs/aar directory
+            if (output.outputFile != null && output.outputFile.name.endsWith('.aar')) {
+                def baseName = project.name
+                def versionSuffix = "-r${project.ext.releaseVersion}"
+                def buildType = variant.buildType.name
+                // Example: library-core-release-r2.19.1.aar
+                def newName = "${baseName}-${buildType}${versionSuffix}.aar"
+                output.outputFileName = newName
+            }
+        }
+
+        // This task runs after the specific variant's assemble task (e.g., assembleRelease)
+        // and copies THE EXACT AAR produced by that variant.
+        variant.assembleProvider.get().doLast {
+            def outputsDir = new File(rootProject.projectDir, "outputs")
+            if (!outputsDir.exists()) {
+                outputsDir.mkdirs()
+            }
+
+            variant.outputs.each { output ->
+                if (output.outputFile != null && output.outputFile.name.endsWith('.aar')) {
+                    // output.outputFile is the AAR file, already correctly named.
+                    // Example: /path/to/ExoPlayer/library/core/build/outputs/aar/library-core-release-r2.19.1.aar
+                    def sourceAarFile = output.outputFile 
+                    
+                    if (sourceAarFile.exists()) {
+                        copy {
+                            from sourceAarFile
+                            into outputsDir
+                        }
+                        println "Copied ${sourceAarFile.name} from ${project.name} to ${outputsDir.absolutePath}"
+                    } else {
+                        println "Warning: Expected AAR file not found for ${project.name} variant ${variant.name}: ${sourceAarFile.absolutePath}"
+                    }
+                }
+            }
+        }
+    }
+}

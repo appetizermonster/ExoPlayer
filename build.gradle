@@ -37,3 +37,81 @@ allprojects {
 }
 
 apply from: 'javadoc_combined.gradle'
+
+// Task to prepare outputs directory (runs BEFORE assembly)
+task prepareOutputsDirectory {
+    group = 'build'
+    description = 'Prepares the outputs directory by cleaning it'
+    
+    doLast {
+        def outputsDir = new File(rootDir, 'outputs')
+        if (outputsDir.exists()) {
+            outputsDir.deleteDir()
+        }
+        outputsDir.mkdirs()
+        println "Prepared clean outputs directory: ${outputsDir.absolutePath}"
+    }
+}
+
+// Task to build and collect all AAR files
+task buildAllAars {
+    group = 'build'
+    description = 'Builds all library modules and collects AAR files in outputs directory'
+    dependsOn prepareOutputsDirectory
+}
+
+task buildAllAarsRelease {
+    group = 'build'
+    description = 'Builds all library modules (Release) and collects AAR files in outputs directory'
+    dependsOn prepareOutputsDirectory
+}
+
+task buildAllAarsDebug {
+    group = 'build'
+    description = 'Builds all library modules (Debug) and collects AAR files in outputs directory'
+    dependsOn prepareOutputsDirectory
+}
+
+// Configure dependencies for library modules
+subprojects { subproject ->
+    if (subproject.name.startsWith('library-') || subproject.name == 'library') {
+        // Make assemble tasks depend on directory preparation
+        subproject.tasks.matching { task -> 
+            task.name == 'assembleRelease' || task.name == 'assembleDebug' 
+        }.all { assembleTask ->
+            assembleTask.mustRunAfter prepareOutputsDirectory
+        }
+        
+        buildAllAars.dependsOn subproject.tasks.matching { task -> 
+            task.name == 'assembleRelease' || task.name == 'assembleDebug' 
+        }
+        buildAllAarsRelease.dependsOn subproject.tasks.matching { task -> 
+            task.name == 'assembleRelease' 
+        }
+        buildAllAarsDebug.dependsOn subproject.tasks.matching { task -> 
+            task.name == 'assembleDebug' 
+        }
+    }
+}
+
+// Also include extension modules
+subprojects { subproject ->
+    if (subproject.name.startsWith('extension-')) {
+        // Make assemble tasks depend on directory preparation
+        subproject.tasks.matching { task -> 
+            task.name == 'assembleRelease' || task.name == 'assembleDebug' 
+        }.all { assembleTask ->
+            assembleTask.mustRunAfter prepareOutputsDirectory
+        }
+        
+        buildAllAars.dependsOn subproject.tasks.matching { task -> 
+            task.name == 'assembleRelease' || task.name == 'assembleDebug' 
+        }
+        buildAllAarsRelease.dependsOn subproject.tasks.matching { task -> 
+            task.name == 'assembleRelease' 
+        }
+        buildAllAarsDebug.dependsOn subproject.tasks.matching { task -> 
+            task.name == 'assembleDebug' 
+        }
+    }
+}

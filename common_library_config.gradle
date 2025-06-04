@@ -46,3 +46,6 @@ dependencies {
     androidTestImplementation 'androidx.multidex:multidex:' + androidxMultidexVersion
     coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:1.1.5'
 }
+
+// Apply AAR output configuration
+apply from: "$gradle.ext.exoplayerSettingsDir/aar_output_config.gradle"
