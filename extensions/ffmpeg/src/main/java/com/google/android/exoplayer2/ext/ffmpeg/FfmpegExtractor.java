@@ -24,6 +24,13 @@ public final class FfmpegExtractor implements Extractor {
   private static final int SNIFF_BUFFER_SIZE = 16;
   private static final int PACKET_BUFFER_SIZE = 32768;
   private static final int MAX_INPUT_LENGTH = 15 * 1024 * 1024; // 15 MB
+  private static byte[] ASF_SIGNATURE = new byte[]{
+      (byte) 0x30, (byte) 0x26, (byte) 0xB2, (byte) 0x75,
+      (byte) 0x8E, (byte) 0x66, (byte) 0xCF, (byte) 0x11,
+      (byte) 0xA6, (byte) 0xD9, (byte) 0x00, (byte) 0xAA,
+      (byte) 0x00, (byte) 0x62, (byte) 0xCE, (byte) 0x6C
+  };
+
 
   // FFmpeg codec IDs (subset relevant for ASF/WMA)
   private static final int AV_CODEC_ID_WMAV1 = 0x15000 + 7;
@@ -33,17 +40,12 @@ public final class FfmpegExtractor implements Extractor {
   private ExtractorOutput extractorOutput;
   private TrackOutput trackOutput;
   private boolean tracksInitialized;
-  @Nullable
-  private byte[] inputData;
-  private int inputLength = C.LENGTH_UNSET;
   private final byte[] packetBuffer;
   private final long[] timestampBuffer;
   private boolean endOfInput;
+  private boolean released;
 
-  public FfmpegExtractor() throws FfmpegDecoderException {
-    if (!FfmpegLibrary.isAvailable()) {
-      throw new FfmpegDecoderException("Failed to load decoder native libraries.");
-    }
+  public FfmpegExtractor() {
     packetBuffer = new byte[PACKET_BUFFER_SIZE];
     timestampBuffer = new long[1];
     tracksInitialized = false;
@@ -53,15 +55,20 @@ public final class FfmpegExtractor implements Extractor {
 
   @Override
   public boolean sniff(ExtractorInput input) throws IOException {
-    byte[] sniffBuffer = new byte[SNIFF_BUFFER_SIZE];
-    input.peekFully(sniffBuffer, 0, SNIFF_BUFFER_SIZE);
-
-    try {
-      return nativeSniff(sniffBuffer, SNIFF_BUFFER_SIZE);
-    } catch (UnsatisfiedLinkError e) {
-      Log.e(TAG, "Native sniff method not available", e);
+    if (released) {
       return false;
     }
+
+    byte[] sniffData = new byte[SNIFF_BUFFER_SIZE];
+    input.peekFully(sniffData, 0, SNIFF_BUFFER_SIZE);
+
+    // ASF GUID signature
+    for (int i = 0; i < 16; i++) {
+      if (sniffData[i] != ASF_SIGNATURE[i]) {
+        return false;
+      }
+    }
+    return true;
   }
 
   @Override
@@ -74,26 +81,32 @@ public final class FfmpegExtractor implements Extractor {
   @Override
   public @ReadResult int read(ExtractorInput input, PositionHolder seekPosition)
       throws IOException {
+    if (released) {
+      return RESULT_END_OF_INPUT;
+    }
     if (endOfInput) {
       return RESULT_END_OF_INPUT;
     }
 
-    if (inputData == null) {
-      inputLength = (int) input.getLength();
-      if (inputLength <= 0) {
-        throw new IOException("Input length must be greater than zero.");
-      }
-      if (inputLength > MAX_INPUT_LENGTH) {
-        throw new IOException("Input length exceeds maximum allowed size: " + MAX_INPUT_LENGTH);
-      }
-
-      inputData = new byte[inputLength];
-      boolean result = input.readFully(inputData, 0, inputLength, true);
-      Log.d(TAG, "Read " + inputLength + " bytes from input: " + result);
-    }
-
     try {
       if (nativeContext == 0) {
+        if (!FfmpegLibrary.isAvailable()) {
+          throw ParserException.createForMalformedContainer(
+              "Failed to load decoder native libraries.", null);
+        }
+
+        int inputLength = (int) input.getLength();
+        if (inputLength <= 0) {
+          throw new IOException("Input length must be greater than zero.");
+        }
+        if (inputLength > MAX_INPUT_LENGTH) {
+          throw new IOException("Input length exceeds maximum allowed size: " + MAX_INPUT_LENGTH);
+        }
+
+        byte[] inputData = new byte[inputLength];
+        boolean result = input.readFully(inputData, 0, inputLength, true);
+        Log.d(TAG, "Read " + inputLength + " bytes from input: " + result);
+
         nativeContext = nativeCreateContext(inputData, inputLength);
         if (nativeContext == 0) {
           Log.e(TAG, "Failed to create native context");
@@ -214,6 +227,10 @@ public final class FfmpegExtractor implements Extractor {
 
   @Override
   public void seek(long position, long timeUs) {
+    if (released) {
+      return;
+    }
+
     Log.d(TAG, "seek: position: " + position + ", timeUs: " + timeUs);
     if (nativeContext != 0) {
       nativeSeek(nativeContext, timeUs);
@@ -234,14 +251,11 @@ public final class FfmpegExtractor implements Extractor {
     }
     tracksInitialized = false;
     endOfInput = false;
-    inputLength = C.LENGTH_UNSET;
-    inputData = null;
+    released = true;
   }
 
   // JNI method declarations
   private native long nativeCreateContext(byte[] inputData, int inputLength);
-
-  private native boolean nativeSniff(byte[] data, int length);
 
   private native int nativeGetAudioCodecId(long context);
 

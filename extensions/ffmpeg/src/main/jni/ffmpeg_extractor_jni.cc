@@ -41,16 +41,13 @@ extern "C"
 #define AVIO_BUFFER_SIZE (32 * 1024) // 32KB AVIO buffer
 
 struct InputWrapper {
-  JNIEnv *env;
-  jbyteArray data_array;
-  jbyte *data_buf;
+  uint8_t *data_buf;
   int64_t data_len;
   int64_t cur_pos;
 };
 
 struct FfmpegDemuxContext {
   AVFormatContext *format_ctx;
-  uint8_t *avio_buffer;
   AVIOContext *avio_ctx;
   int audio_stream_index;
   AVStream *audio_stream;
@@ -68,9 +65,19 @@ static int input_wrapper_init(
     JNIEnv *env,
     jbyteArray inputData,
     jint inputLength) {
-  iw->env = env;
-  iw->data_array = (jbyteArray) env->NewGlobalRef(inputData);
-  iw->data_buf = env->GetByteArrayElements(iw->data_array, NULL);
+  iw->data_buf = (uint8_t *) malloc(inputLength * sizeof(uint8_t));
+  if (!iw->data_buf) {
+    LOGD("input_wrapper_init: failed to allocate data_buf");
+    return AVERROR(ENOMEM);
+  }
+
+  env->GetByteArrayRegion(inputData, 0, inputLength, (jbyte *) iw->data_buf);
+  if (env->ExceptionCheck()) {
+    LOGD("input_wrapper_init: failed to get byte array region");
+    free(iw->data_buf);
+    return AVERROR(EINVAL);
+  }
+
   iw->data_len = inputLength;
   iw->cur_pos = 0;
   LOGD("input_wrapper_init: cur_pos: %lld, length: %lld", iw->cur_pos, iw->data_len);
@@ -80,7 +87,12 @@ static int input_wrapper_init(
 static int input_wrapper_read(InputWrapper *iw, uint8_t *buf, int buf_size) {
   LOGD("input_wrapper_read: buf_size=%d", buf_size);
   if (!buf || buf_size <= 0) {
-    LOGD("input_wrapper_read: invalid parameters");
+    LOGE("input_wrapper_read: invalid parameters");
+    return AVERROR(EINVAL);
+  }
+
+  if (!iw->data_buf) {
+    LOGE("input_wrapper_read: data_buf is NULL");
     return AVERROR(EINVAL);
   }
 
@@ -93,6 +105,11 @@ static int input_wrapper_read(InputWrapper *iw, uint8_t *buf, int buf_size) {
 
   int64_t remaining = size - pos;
   int64_t to_copy = remaining < buf_size ? remaining : buf_size;
+  if (to_copy <= 0) {
+    LOGE("input_wrapper_read: to_copy is 0");
+    return 0;
+  }
+
   memcpy(buf, iw->data_buf + pos, to_copy);
   iw->cur_pos += to_copy;
 
@@ -101,6 +118,11 @@ static int input_wrapper_read(InputWrapper *iw, uint8_t *buf, int buf_size) {
 
 static int64_t input_wrapper_seek(InputWrapper *iw, int64_t offset, int whence) {
   LOGD("input_wrapper_seek: offset=%lld, whence=%d", offset, whence);
+  if (!iw->data_buf) {
+    LOGE("input_wrapper_seek: data_buf is NULL");
+    return AVERROR(EINVAL);
+  }
+
   if (whence & AVSEEK_SIZE) {
     return iw->data_len;
   }
@@ -121,7 +143,7 @@ static int64_t input_wrapper_seek(InputWrapper *iw, int64_t offset, int whence) 
   }
 
   if (target < 0 || target > iw->data_len) {
-    LOGD("input_wrapper_seek: overflow, target=%lld, length=%lld", target, iw->data_len);
+    LOGE("input_wrapper_seek: overflow, target=%lld, length=%lld", target, iw->data_len);
     return AVERROR(EINVAL);
   }
 
@@ -130,12 +152,12 @@ static int64_t input_wrapper_seek(InputWrapper *iw, int64_t offset, int whence) 
 }
 
 static void input_wrapper_free(InputWrapper *iw) {
-  if (iw->env && iw->data_array && iw->data_buf) {
-    iw->env->ReleaseByteArrayElements(iw->data_array, iw->data_buf, JNI_ABORT);
-    iw->env->DeleteGlobalRef(iw->data_array);
-    iw->data_array = NULL;
+  if (iw->data_buf) {
+    free(iw->data_buf);
     iw->data_buf = NULL;
   }
+  iw->data_len = 0;
+  iw->cur_pos = 0;
 }
 
 static int avio_read_packet_callback(void *opaque, uint8_t *buf, int buf_size) {
@@ -149,24 +171,31 @@ static int64_t avio_seek_callback(void *opaque, int64_t offset, int whence) {
 }
 
 static void demux_context_free(FfmpegDemuxContext *ctx) {
+  LOGD("demux_context_free: format_ctx");
   if (ctx->format_ctx) {
     avformat_close_input(&ctx->format_ctx);
+    ctx->format_ctx = NULL;
+    ctx->audio_stream_index = -1;
+    ctx->audio_stream = NULL;
   }
 
-  if (ctx->avio_buffer) {
-    av_freep(&ctx->avio_buffer);
-  }
-
+  LOGD("demux_context_free: avio_ctx");
   if (ctx->avio_ctx) {
+    av_freep(&ctx->avio_ctx->buffer);
     avio_context_free(&ctx->avio_ctx);
+    ctx->avio_ctx = NULL;
   }
 
+  LOGD("demux_context_free: input_wrapper");
   if (ctx->input_wrapper) {
     input_wrapper_free(ctx->input_wrapper);
     free(ctx->input_wrapper);
+    ctx->input_wrapper = NULL;
   }
 
+  LOGD("demux_context_free: ctx");
   free(ctx);
+  LOGD("demux_context_free: done");
 }
 
 FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inputLength) {
@@ -196,8 +225,8 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
     return 0L;
   }
 
-  ctx->avio_buffer = (uint8_t *) av_malloc(AVIO_BUFFER_SIZE);
-  if (!ctx->avio_buffer) {
+  unsigned char *avio_buffer = (unsigned char *) av_malloc(AVIO_BUFFER_SIZE);
+  if (!avio_buffer) {
     LOGE("Failed to allocate AVIO buffer");
     demux_context_free(ctx);
     return 0L;
@@ -205,7 +234,7 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
 
   // Create AVIOContext
   ctx->avio_ctx = avio_alloc_context(
-      ctx->avio_buffer,
+      avio_buffer,
       AVIO_BUFFER_SIZE,
       0, // write_flag (0 for read-only)
       ctx,
@@ -215,6 +244,7 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
 
   if (!ctx->avio_ctx) {
     LOGE("Failed to allocate AVIOContext");
+    av_free(avio_buffer);
     demux_context_free(ctx);
     return 0L;
   }
@@ -277,32 +307,10 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
   return (jlong) ctx;
 }
 
-FFMPEG_EXTRACTOR_FUNC(jboolean, nativeSniff, jbyteArray data, jint length) {
-  if (!data || length < 16) {
-    return JNI_FALSE;
-  }
-
-  jbyte *bytes = env->GetByteArrayElements(data, NULL);
-  if (!bytes) {
-    return JNI_FALSE;
-  }
-
-  // ASF GUID signature: 30 26 B2 75 8E 66 CF 11 A6 D9 00 AA 00 62 CE 6C
-  static const uint8_t asf_signature[] = {
-      0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11,
-      0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C};
-
-  jboolean result = (memcmp(bytes, asf_signature, 16) == 0) ? JNI_TRUE : JNI_FALSE;
-
-  env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
-  return result;
-}
-
 FFMPEG_EXTRACTOR_FUNC(jint, nativeGetAudioCodecId, jlong context) {
   FfmpegDemuxContext *ctx = (FfmpegDemuxContext *) context;
   if (!ctx || ctx->audio_stream_index == -1) {
-    return
-        AV_CODEC_ID_NONE;
+    return AV_CODEC_ID_NONE;
   }
 
   return (jint) ctx->audio_stream->codecpar->codec_id;
