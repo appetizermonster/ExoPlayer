@@ -2,6 +2,8 @@
 #include <jni.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
 
 extern "C"
 {
@@ -40,9 +42,18 @@ extern "C"
 
 #define AVIO_BUFFER_SIZE (32 * 1024) // 32KB AVIO buffer
 
+// Memory-based input wrapper (existing approach for non-local files)
 struct InputWrapper {
   uint8_t *data_buf;
   int64_t data_len;
+  int64_t cur_pos;
+};
+
+// File descriptor-based input wrapper (new approach for local files)
+struct FdInputWrapper {
+  int fd;
+  int64_t start_offset;  // For content:// URIs with AssetFileDescriptor
+  int64_t length;
   int64_t cur_pos;
 };
 
@@ -51,7 +62,10 @@ struct FfmpegDemuxContext {
   AVIOContext *avio_ctx;
   int audio_stream_index;
   AVStream *audio_stream;
-  InputWrapper *input_wrapper;
+  // Either memory-based or fd-based (only one is non-null)
+  InputWrapper *input_wrapper;      // Memory-based (existing)
+  FdInputWrapper *fd_input_wrapper; // Fd-based (new)
+  bool use_fd;
 };
 
 void log_error(const char *func_name, int error_no) {
@@ -160,6 +174,103 @@ static void input_wrapper_free(InputWrapper *iw) {
   iw->cur_pos = 0;
 }
 
+// ============================================================================
+// File descriptor-based input wrapper functions (for local files)
+// ============================================================================
+
+static int fd_input_wrapper_init(FdInputWrapper *iw, int fd, int64_t startOffset, int64_t length) {
+  iw->fd = fd;
+  iw->start_offset = startOffset;
+  iw->length = length;
+  iw->cur_pos = 0;
+  LOGD("fd_input_wrapper_init: fd=%d, start_offset=%lld, length=%lld",
+       fd, (long long) startOffset, (long long) length);
+  return 0;
+}
+
+// Uses pread() for thread-safe positioned reads without modifying file position
+static int fd_input_wrapper_read(FdInputWrapper *iw, uint8_t *buf, int buf_size) {
+  LOGD("fd_input_wrapper_read: buf_size=%d, cur_pos=%lld", buf_size, (long long) iw->cur_pos);
+  if (!buf || buf_size <= 0) {
+    LOGE("fd_input_wrapper_read: invalid parameters");
+    return AVERROR(EINVAL);
+  }
+
+  if (iw->fd < 0) {
+    LOGE("fd_input_wrapper_read: invalid fd");
+    return AVERROR(EINVAL);
+  }
+
+  if (iw->cur_pos >= iw->length) {
+    return AVERROR_EOF;
+  }
+
+  int64_t remaining = iw->length - iw->cur_pos;
+  int64_t to_read = remaining < buf_size ? remaining : buf_size;
+
+  // pread() reads at offset without changing file position (thread-safe)
+  ssize_t bytes_read = pread(iw->fd, buf, (size_t) to_read, iw->start_offset + iw->cur_pos);
+  if (bytes_read < 0) {
+    LOGE("fd_input_wrapper_read: pread failed with errno=%d", errno);
+    return AVERROR(errno);
+  }
+  if (bytes_read == 0) {
+    return AVERROR_EOF;
+  }
+
+  iw->cur_pos += bytes_read;
+  return (int) bytes_read;
+}
+
+static int64_t fd_input_wrapper_seek(FdInputWrapper *iw, int64_t offset, int whence) {
+  LOGD("fd_input_wrapper_seek: offset=%lld, whence=%d", (long long) offset, whence);
+  if (iw->fd < 0) {
+    LOGE("fd_input_wrapper_seek: invalid fd");
+    return AVERROR(EINVAL);
+  }
+
+  if (whence & AVSEEK_SIZE) {
+    return iw->length;
+  }
+
+  int64_t target;
+  switch (whence & ~AVSEEK_FORCE) {
+    case SEEK_SET:
+      target = offset;
+      break;
+    case SEEK_CUR:
+      target = iw->cur_pos + offset;
+      break;
+    case SEEK_END:
+      target = iw->length + offset;
+      break;
+    default:
+      return AVERROR(EINVAL);
+  }
+
+  if (target < 0 || target > iw->length) {
+    LOGE("fd_input_wrapper_seek: overflow, target=%lld, length=%lld",
+         (long long) target, (long long) iw->length);
+    return AVERROR(EINVAL);
+  }
+
+  iw->cur_pos = target;
+  return target;
+}
+
+static void fd_input_wrapper_free(FdInputWrapper *iw) {
+  // Note: We don't close the fd here - Java is responsible for fd lifecycle
+  iw->fd = -1;
+  iw->start_offset = 0;
+  iw->length = 0;
+  iw->cur_pos = 0;
+}
+
+// ============================================================================
+// AVIO callbacks
+// ============================================================================
+
+// Memory-based AVIO callbacks
 static int avio_read_packet_callback(void *opaque, uint8_t *buf, int buf_size) {
   FfmpegDemuxContext *ctx = (FfmpegDemuxContext *) opaque;
   return input_wrapper_read(ctx->input_wrapper, buf, buf_size);
@@ -168,6 +279,17 @@ static int avio_read_packet_callback(void *opaque, uint8_t *buf, int buf_size) {
 static int64_t avio_seek_callback(void *opaque, int64_t offset, int whence) {
   FfmpegDemuxContext *ctx = (FfmpegDemuxContext *) opaque;
   return input_wrapper_seek(ctx->input_wrapper, offset, whence);
+}
+
+// File descriptor-based AVIO callbacks
+static int avio_read_fd_callback(void *opaque, uint8_t *buf, int buf_size) {
+  FfmpegDemuxContext *ctx = (FfmpegDemuxContext *) opaque;
+  return fd_input_wrapper_read(ctx->fd_input_wrapper, buf, buf_size);
+}
+
+static int64_t avio_seek_fd_callback(void *opaque, int64_t offset, int whence) {
+  FfmpegDemuxContext *ctx = (FfmpegDemuxContext *) opaque;
+  return fd_input_wrapper_seek(ctx->fd_input_wrapper, offset, whence);
 }
 
 static void demux_context_free(FfmpegDemuxContext *ctx) {
@@ -191,6 +313,13 @@ static void demux_context_free(FfmpegDemuxContext *ctx) {
     input_wrapper_free(ctx->input_wrapper);
     free(ctx->input_wrapper);
     ctx->input_wrapper = NULL;
+  }
+
+  LOGD("demux_context_free: fd_input_wrapper");
+  if (ctx->fd_input_wrapper) {
+    fd_input_wrapper_free(ctx->fd_input_wrapper);
+    free(ctx->fd_input_wrapper);
+    ctx->fd_input_wrapper = NULL;
   }
 
   LOGD("demux_context_free: ctx");
@@ -265,6 +394,118 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
   LOGD("Opening input, skip_initial_bytes: %lld, format_probesize: %d",
        ctx->format_ctx->skip_initial_bytes,
        ctx->format_ctx->format_probesize);
+
+  int ret = avformat_open_input(&ctx->format_ctx, NULL, NULL, NULL);
+  if (ret < 0) {
+    log_error("avformat_open_input", ret);
+    demux_context_free(ctx);
+    return 0L;
+  }
+
+  // Find stream info
+  LOGD("Finding stream info");
+  ret = avformat_find_stream_info(ctx->format_ctx, NULL);
+  if (ret < 0) {
+    log_error("avformat_find_stream_info", ret);
+    demux_context_free(ctx);
+    return 0L;
+  }
+  LOGD("Stream info found");
+
+  // Find first audio stream
+  for (unsigned int i = 0; i < ctx->format_ctx->nb_streams; i++) {
+    if (ctx->format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+      ctx->audio_stream_index = (int) i;
+      ctx->audio_stream = ctx->format_ctx->streams[i];
+      break;
+    }
+  }
+
+  if (ctx->audio_stream_index == -1) {
+    LOGE("No audio stream found");
+    demux_context_free(ctx);
+    return 0L;
+  }
+
+  LOGD("Audio stream index: %d", ctx->audio_stream_index);
+  LOGD("Audio codec: %s", avcodec_get_name(ctx->audio_stream->codecpar->codec_id));
+  LOGD("Sample rate: %d", ctx->audio_stream->codecpar->sample_rate);
+  LOGD("Channels: %d", ctx->audio_stream->codecpar->channels);
+  LOGD("Bit rate: %lld", (long long) ctx->audio_stream->codecpar->bit_rate);
+
+  return (jlong) ctx;
+}
+
+// Creates context from file descriptor (for local files - no memory buffering needed)
+FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContextFromFd, jint fd, jlong startOffset, jlong length) {
+  if (fd < 0 || length <= 0) {
+    LOGE("Invalid parameters for nativeCreateContextFromFd: fd=%d, length=%lld",
+         fd, (long long) length);
+    return 0L;
+  }
+
+  FfmpegDemuxContext *ctx = (FfmpegDemuxContext *) calloc(1, sizeof(FfmpegDemuxContext));
+  if (!ctx) {
+    LOGE("Failed to allocate FfmpegDemuxContext");
+    return 0L;
+  }
+
+  ctx->audio_stream_index = -1;
+  ctx->use_fd = true;
+
+  ctx->fd_input_wrapper = (FdInputWrapper *) calloc(1, sizeof(FdInputWrapper));
+  if (!ctx->fd_input_wrapper) {
+    LOGE("Failed to allocate FdInputWrapper");
+    demux_context_free(ctx);
+    return 0L;
+  }
+
+  // Initialize fd input wrapper
+  if (fd_input_wrapper_init(ctx->fd_input_wrapper, fd, startOffset, length) < 0) {
+    LOGE("Failed to initialize fd input wrapper");
+    demux_context_free(ctx);
+    return 0L;
+  }
+
+  unsigned char *avio_buffer = (unsigned char *) av_malloc(AVIO_BUFFER_SIZE);
+  if (!avio_buffer) {
+    LOGE("Failed to allocate AVIO buffer");
+    demux_context_free(ctx);
+    return 0L;
+  }
+
+  // Create AVIOContext with fd-based callbacks
+  ctx->avio_ctx = avio_alloc_context(
+      avio_buffer,
+      AVIO_BUFFER_SIZE,
+      0, // write_flag (0 for read-only)
+      ctx,
+      avio_read_fd_callback,
+      NULL, // write_packet
+      avio_seek_fd_callback);
+
+  if (!ctx->avio_ctx) {
+    LOGE("Failed to allocate AVIOContext");
+    av_free(avio_buffer);
+    demux_context_free(ctx);
+    return 0L;
+  }
+
+  // Create format context
+  ctx->format_ctx = avformat_alloc_context();
+  if (!ctx->format_ctx) {
+    LOGE("Failed to allocate format context");
+    demux_context_free(ctx);
+    return 0L;
+  }
+
+  ctx->format_ctx->format_probesize = 64 * 1024; // 64KB
+  ctx->format_ctx->pb = ctx->avio_ctx;
+  ctx->format_ctx->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+  // Open input
+  LOGD("Opening input from fd, start_offset: %lld, length: %lld",
+       (long long) startOffset, (long long) length);
 
   int ret = avformat_open_input(&ctx->format_ctx, NULL, NULL, NULL);
   if (ret < 0) {

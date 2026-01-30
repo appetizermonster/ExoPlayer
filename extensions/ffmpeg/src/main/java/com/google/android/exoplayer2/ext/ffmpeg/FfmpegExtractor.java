@@ -45,7 +45,27 @@ public final class FfmpegExtractor implements Extractor {
   private boolean endOfInput;
   private boolean released;
 
+  /**
+   * Optional file descriptor info for direct file access (no memory buffering).
+   */
+  @Nullable
+  private final FfmpegFileDescriptorInfo fdInfo;
+
+  /**
+   * Creates an extractor that uses memory buffering (limited to MAX_INPUT_LENGTH).
+   */
   public FfmpegExtractor() {
+    this(/* fdInfo= */ null);
+  }
+
+  /**
+   * Creates an extractor with optional file descriptor for direct file access.
+   *
+   * @param fdInfo File descriptor info for local files, or null to use memory buffering.
+   *               When provided, bypasses the MAX_INPUT_LENGTH limit.
+   */
+  public FfmpegExtractor(@Nullable FfmpegFileDescriptorInfo fdInfo) {
+    this.fdInfo = fdInfo;
     packetBuffer = new byte[PACKET_BUFFER_SIZE];
     timestampBuffer = new long[1];
     tracksInitialized = false;
@@ -95,19 +115,28 @@ public final class FfmpegExtractor implements Extractor {
               "Failed to load decoder native libraries.", null);
         }
 
-        int inputLength = (int) input.getLength();
-        if (inputLength <= 0) {
-          throw new IOException("Input length must be greater than zero.");
-        }
-        if (inputLength > MAX_INPUT_LENGTH) {
-          throw new IOException("Input length exceeds maximum allowed size: " + MAX_INPUT_LENGTH);
+        if (fdInfo != null) {
+          // Use file descriptor-based access (no memory buffering, no size limit)
+          Log.d(TAG, "Creating native context from fd: " + fdInfo.fd
+              + ", offset: " + fdInfo.startOffset + ", length: " + fdInfo.length);
+          nativeContext = nativeCreateContextFromFd(fdInfo.fd, fdInfo.startOffset, fdInfo.length);
+        } else {
+          // Fallback to memory buffering (existing approach with size limit)
+          int inputLength = (int) input.getLength();
+          if (inputLength <= 0) {
+            throw new IOException("Input length must be greater than zero.");
+          }
+          if (inputLength > MAX_INPUT_LENGTH) {
+            throw new IOException("Input length exceeds maximum allowed size: " + MAX_INPUT_LENGTH);
+          }
+
+          byte[] inputData = new byte[inputLength];
+          boolean result = input.readFully(inputData, 0, inputLength, true);
+          Log.d(TAG, "Read " + inputLength + " bytes from input: " + result);
+
+          nativeContext = nativeCreateContext(inputData, inputLength);
         }
 
-        byte[] inputData = new byte[inputLength];
-        boolean result = input.readFully(inputData, 0, inputLength, true);
-        Log.d(TAG, "Read " + inputLength + " bytes from input: " + result);
-
-        nativeContext = nativeCreateContext(inputData, inputLength);
         if (nativeContext == 0) {
           Log.e(TAG, "Failed to create native context");
           throw ParserException.createForMalformedContainer("Failed to create native context",
@@ -249,6 +278,10 @@ public final class FfmpegExtractor implements Extractor {
       }
       nativeContext = 0;
     }
+    // Close file resources after native context is released
+    if (fdInfo != null) {
+      fdInfo.close();
+    }
     tracksInitialized = false;
     endOfInput = false;
     released = true;
@@ -256,6 +289,8 @@ public final class FfmpegExtractor implements Extractor {
 
   // JNI method declarations
   private native long nativeCreateContext(byte[] inputData, int inputLength);
+
+  private native long nativeCreateContextFromFd(int fd, long startOffset, long length);
 
   private native int nativeGetAudioCodecId(long context);
 
