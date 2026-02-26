@@ -40,8 +40,9 @@ import java.util.List;
 /* package */ final class FfmpegAudioDecoder
     extends SimpleDecoder<DecoderInputBuffer, SimpleDecoderOutputBuffer, FfmpegDecoderException> {
 
-  // Output buffer sizes when decoding PCM mu-law streams, which is the maximum FFmpeg outputs.
-  private static final int OUTPUT_BUFFER_SIZE_16BIT = 65536;
+  // Output buffer sizes. Must be large enough to hold decoded PCM from a single WMA superframe,
+  // which can contain multiple sub-frames (up to ~32), each producing ~2048 stereo samples.
+  private static final int OUTPUT_BUFFER_SIZE_16BIT = 131072;
   private static final int OUTPUT_BUFFER_SIZE_32BIT = OUTPUT_BUFFER_SIZE_16BIT * 2;
 
   private static final int AUDIO_DECODER_ERROR_INVALID_DATA = -1;

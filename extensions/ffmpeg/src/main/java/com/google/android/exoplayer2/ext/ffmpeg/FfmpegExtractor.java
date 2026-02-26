@@ -1,5 +1,8 @@
 package com.google.android.exoplayer2.ext.ffmpeg;
 
+import android.content.Context;
+import android.net.Uri;
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import com.google.android.exoplayer2.C;
 import com.google.android.exoplayer2.Format;
@@ -17,20 +20,27 @@ import java.util.ArrayList;
 
 /**
  * Extracts data from files using FFmpeg demuxing.
+ *
+ * <p>Uses fd-based I/O via {@code pread()}, reading directly from disk with only a 32KB AVIO
+ * buffer in memory. Requires a {@link Context} and {@link Uri}, provided automatically by {@link
+ * com.google.android.exoplayer2.extractor.DefaultExtractorsFactory} when configured with {@link
+ * com.google.android.exoplayer2.extractor.DefaultExtractorsFactory#setContext(Context)}.
  */
 public final class FfmpegExtractor implements Extractor {
 
   private static final String TAG = "FfmpegExtractor";
   private static final int SNIFF_BUFFER_SIZE = 16;
   private static final int PACKET_BUFFER_SIZE = 32768;
-  private static final int MAX_INPUT_LENGTH = 15 * 1024 * 1024; // 15 MB
-  private static byte[] ASF_SIGNATURE = new byte[]{
+  private static final byte[] ASF_SIGNATURE = new byte[]{
       (byte) 0x30, (byte) 0x26, (byte) 0xB2, (byte) 0x75,
       (byte) 0x8E, (byte) 0x66, (byte) 0xCF, (byte) 0x11,
       (byte) 0xA6, (byte) 0xD9, (byte) 0x00, (byte) 0xAA,
       (byte) 0x00, (byte) 0x62, (byte) 0xCE, (byte) 0x6C
   };
 
+
+  // FFmpeg AVERROR_EOF: -(int)(('E') | ('O' << 8) | ('F' << 16) | ((unsigned)' ' << 24))
+  private static final int AVERROR_EOF = -541478725;
 
   // FFmpeg codec IDs (subset relevant for ASF/WMA)
   private static final int AV_CODEC_ID_WMAV1 = 0x15000 + 7;
@@ -41,16 +51,34 @@ public final class FfmpegExtractor implements Extractor {
   private TrackOutput trackOutput;
   private boolean tracksInitialized;
   private final byte[] packetBuffer;
+  private final ParsableByteArray packetData;
   private final long[] timestampBuffer;
   private boolean endOfInput;
   private boolean released;
 
-  public FfmpegExtractor() {
+  // For fd-based I/O (lazily initialized)
+  @NonNull private final Context context;
+  @NonNull private final Uri uri;
+  @Nullable private FfmpegFileDescriptorInfo fdInfo;
+
+  /**
+   * Creates an extractor that will use fd-based I/O.
+   *
+   * <p>The file descriptor is not opened until the first call to {@link #read}, avoiding resource
+   * leaks if this extractor loses sniffing and is never used.
+   *
+   * @param context The application context. Used to resolve content:// URIs.
+   * @param uri The URI of the media to extract.
+   */
+  public FfmpegExtractor(@NonNull Context context, @NonNull Uri uri) {
     packetBuffer = new byte[PACKET_BUFFER_SIZE];
+    packetData = new ParsableByteArray(packetBuffer, 0);
     timestampBuffer = new long[1];
     tracksInitialized = false;
     endOfInput = false;
     nativeContext = 0;
+    this.context = context.getApplicationContext();
+    this.uri = uri;
   }
 
   @Override
@@ -95,24 +123,7 @@ public final class FfmpegExtractor implements Extractor {
               "Failed to load decoder native libraries.", null);
         }
 
-        int inputLength = (int) input.getLength();
-        if (inputLength <= 0) {
-          throw new IOException("Input length must be greater than zero.");
-        }
-        if (inputLength > MAX_INPUT_LENGTH) {
-          throw new IOException("Input length exceeds maximum allowed size: " + MAX_INPUT_LENGTH);
-        }
-
-        byte[] inputData = new byte[inputLength];
-        boolean result = input.readFully(inputData, 0, inputLength, true);
-        Log.d(TAG, "Read " + inputLength + " bytes from input: " + result);
-
-        nativeContext = nativeCreateContext(inputData, inputLength);
-        if (nativeContext == 0) {
-          Log.e(TAG, "Failed to create native context");
-          throw ParserException.createForMalformedContainer("Failed to create native context",
-              null);
-        }
+        nativeContext = createContextFromFd();
       }
 
       if (!tracksInitialized) {
@@ -123,7 +134,43 @@ public final class FfmpegExtractor implements Extractor {
       return readSample();
     } catch (UnsatisfiedLinkError e) {
       Log.e(TAG, "Native method not available", e);
+      endOfInput = true;
       return RESULT_END_OF_INPUT;
+    }
+  }
+
+  /**
+   * Creates a native context using fd-based I/O.
+   *
+   * @return The native context pointer.
+   * @throws ParserException if the fd cannot be opened or the native context creation fails.
+   */
+  private long createContextFromFd() throws ParserException {
+    try {
+      fdInfo = FfmpegFileDescriptorInfo.createFromUri(context, uri);
+      if (fdInfo == null) {
+        throw ParserException.createForMalformedContainer(
+            "URI scheme not supported for fd-based I/O: " + uri.getScheme(), null);
+      }
+
+      long ctx = nativeCreateContextFromFd(fdInfo.fd, fdInfo.startOffset, fdInfo.length);
+      if (ctx != 0) {
+        Log.d(TAG, "Created native context from fd (fd=" + fdInfo.fd
+            + ", offset=" + fdInfo.startOffset + ", length=" + fdInfo.length + ")");
+        return ctx;
+      } else {
+        closeFdInfo();
+        throw ParserException.createForMalformedContainer(
+            "nativeCreateContextFromFd returned 0", null);
+      }
+    } catch (IOException e) {
+      closeFdInfo();
+      throw ParserException.createForMalformedContainer(
+          "Failed to open file descriptor for: " + uri, e);
+    } catch (UnsatisfiedLinkError e) {
+      closeFdInfo();
+      throw ParserException.createForMalformedContainer(
+          "nativeCreateContextFromFd not available", e);
     }
   }
 
@@ -165,13 +212,9 @@ public final class FfmpegExtractor implements Extractor {
 
     trackOutput.format(format);
 
-    // Set up seek map
+    // Set up seek map. FFmpeg's format_ctx->duration is already in microseconds (AV_TIME_BASE).
     long durationUs = nativeGetDuration(nativeContext);
-
-    if (durationUs > 0) {
-      // Convert FFmpeg duration (in AV_TIME_BASE units) to microseconds
-      durationUs = (durationUs * 1000000L) / 1000000L; // Already in microseconds from FFmpeg
-    } else {
+    if (durationUs <= 0) {
       durationUs = C.TIME_UNSET;
     }
 
@@ -202,7 +245,7 @@ public final class FfmpegExtractor implements Extractor {
         timestampBuffer);
 
     if (packetSize < 0) {
-      if (packetSize == -541478725) { // AVERROR_EOF
+      if (packetSize == AVERROR_EOF) {
         endOfInput = true;
         return RESULT_END_OF_INPUT;
       }
@@ -215,7 +258,7 @@ public final class FfmpegExtractor implements Extractor {
     }
 
     // Output the packet data to ExoPlayer
-    ParsableByteArray packetData = new ParsableByteArray(packetBuffer, packetSize);
+    packetData.reset(packetBuffer, packetSize);
     trackOutput.sampleData(packetData, packetSize);
 
     // Use extracted timestamp from FFmpeg
@@ -249,13 +292,21 @@ public final class FfmpegExtractor implements Extractor {
       }
       nativeContext = 0;
     }
+    closeFdInfo();
     tracksInitialized = false;
     endOfInput = false;
     released = true;
   }
 
+  private void closeFdInfo() {
+    if (fdInfo != null) {
+      fdInfo.close();
+      fdInfo = null;
+    }
+  }
+
   // JNI method declarations
-  private native long nativeCreateContext(byte[] inputData, int inputLength);
+  private native long nativeCreateContextFromFd(int fd, long startOffset, long length);
 
   private native int nativeGetAudioCodecId(long context);
 

@@ -2,6 +2,8 @@
 #include <jni.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
 
 extern "C"
 {
@@ -40,9 +42,10 @@ extern "C"
 
 #define AVIO_BUFFER_SIZE (32 * 1024) // 32KB AVIO buffer
 
-struct InputWrapper {
-  uint8_t *data_buf;
-  int64_t data_len;
+struct FdInputWrapper {
+  int fd;
+  int64_t start_offset;
+  int64_t length;
   int64_t cur_pos;
 };
 
@@ -51,7 +54,7 @@ struct FfmpegDemuxContext {
   AVIOContext *avio_ctx;
   int audio_stream_index;
   AVStream *audio_stream;
-  InputWrapper *input_wrapper;
+  FdInputWrapper *fd_input_wrapper;
 };
 
 void log_error(const char *func_name, int error_no) {
@@ -60,71 +63,41 @@ void log_error(const char *func_name, int error_no) {
   LOGE("Error in %s: %s", func_name, buffer);
 }
 
-static int input_wrapper_init(
-    InputWrapper *iw,
-    JNIEnv *env,
-    jbyteArray inputData,
-    jint inputLength) {
-  iw->data_buf = (uint8_t *) malloc(inputLength * sizeof(uint8_t));
-  if (!iw->data_buf) {
-    LOGD("input_wrapper_init: failed to allocate data_buf");
-    return AVERROR(ENOMEM);
-  }
+// --- fd-based I/O functions (pread) ---
 
-  env->GetByteArrayRegion(inputData, 0, inputLength, (jbyte *) iw->data_buf);
-  if (env->ExceptionCheck()) {
-    LOGD("input_wrapper_init: failed to get byte array region");
-    free(iw->data_buf);
-    return AVERROR(EINVAL);
-  }
-
-  iw->data_len = inputLength;
-  iw->cur_pos = 0;
-  LOGD("input_wrapper_init: cur_pos: %lld, length: %lld", iw->cur_pos, iw->data_len);
-  return 0;
-}
-
-static int input_wrapper_read(InputWrapper *iw, uint8_t *buf, int buf_size) {
-  LOGD("input_wrapper_read: buf_size=%d", buf_size);
+static int fd_input_wrapper_read(FdInputWrapper *fw, uint8_t *buf, int buf_size) {
+  LOGD("fd_input_wrapper_read: buf_size=%d, cur_pos=%lld", buf_size, (long long) fw->cur_pos);
   if (!buf || buf_size <= 0) {
-    LOGE("input_wrapper_read: invalid parameters");
+    LOGE("fd_input_wrapper_read: invalid parameters");
     return AVERROR(EINVAL);
   }
 
-  if (!iw->data_buf) {
-    LOGE("input_wrapper_read: data_buf is NULL");
-    return AVERROR(EINVAL);
-  }
-
-  int64_t pos = iw->cur_pos;
-  int64_t size = iw->data_len;
-
-  if (pos >= size) {
+  if (fw->cur_pos >= fw->length) {
     return AVERROR_EOF;
   }
 
-  int64_t remaining = size - pos;
-  int64_t to_copy = remaining < buf_size ? remaining : buf_size;
-  if (to_copy <= 0) {
-    LOGE("input_wrapper_read: to_copy is 0");
-    return 0;
+  int64_t remaining = fw->length - fw->cur_pos;
+  int64_t to_read = remaining < buf_size ? remaining : buf_size;
+
+  // pread() reads at a given offset without changing the file's seek position — thread-safe
+  ssize_t bytes_read = pread(fw->fd, buf, (size_t) to_read, fw->start_offset + fw->cur_pos);
+  if (bytes_read < 0) {
+    LOGE("fd_input_wrapper_read: pread failed: %s", strerror(errno));
+    return AVERROR(errno);
+  }
+  if (bytes_read == 0) {
+    return AVERROR_EOF;
   }
 
-  memcpy(buf, iw->data_buf + pos, to_copy);
-  iw->cur_pos += to_copy;
-
-  return (int) to_copy;
+  fw->cur_pos += bytes_read;
+  return (int) bytes_read;
 }
 
-static int64_t input_wrapper_seek(InputWrapper *iw, int64_t offset, int whence) {
-  LOGD("input_wrapper_seek: offset=%lld, whence=%d", offset, whence);
-  if (!iw->data_buf) {
-    LOGE("input_wrapper_seek: data_buf is NULL");
-    return AVERROR(EINVAL);
-  }
+static int64_t fd_input_wrapper_seek(FdInputWrapper *fw, int64_t offset, int whence) {
+  LOGD("fd_input_wrapper_seek: offset=%lld, whence=%d", (long long) offset, whence);
 
   if (whence & AVSEEK_SIZE) {
-    return iw->data_len;
+    return fw->length;
   }
 
   int64_t target;
@@ -133,41 +106,43 @@ static int64_t input_wrapper_seek(InputWrapper *iw, int64_t offset, int whence) 
       target = offset;
       break;
     case SEEK_CUR:
-      target = iw->cur_pos + offset;
+      target = fw->cur_pos + offset;
       break;
     case SEEK_END:
-      target = iw->data_len + offset;
+      target = fw->length + offset;
       break;
     default:
       return AVERROR(EINVAL);
   }
 
-  if (target < 0 || target > iw->data_len) {
-    LOGE("input_wrapper_seek: overflow, target=%lld, length=%lld", target, iw->data_len);
+  if (target < 0 || target > fw->length) {
+    LOGE("fd_input_wrapper_seek: overflow, target=%lld, length=%lld",
+         (long long) target, (long long) fw->length);
     return AVERROR(EINVAL);
   }
 
-  iw->cur_pos = target;
+  fw->cur_pos = target;
   return target;
 }
 
-static void input_wrapper_free(InputWrapper *iw) {
-  if (iw->data_buf) {
-    free(iw->data_buf);
-    iw->data_buf = NULL;
-  }
-  iw->data_len = 0;
-  iw->cur_pos = 0;
+static void fd_input_wrapper_free(FdInputWrapper *fw) {
+  // Do NOT close fd — Java manages the lifecycle via ParcelFileDescriptor/AssetFileDescriptor.
+  fw->fd = -1;
+  fw->start_offset = 0;
+  fw->length = 0;
+  fw->cur_pos = 0;
 }
 
-static int avio_read_packet_callback(void *opaque, uint8_t *buf, int buf_size) {
+// --- AVIO callbacks (fd-based) ---
+
+static int avio_read_fd_callback(void *opaque, uint8_t *buf, int buf_size) {
   FfmpegDemuxContext *ctx = (FfmpegDemuxContext *) opaque;
-  return input_wrapper_read(ctx->input_wrapper, buf, buf_size);
+  return fd_input_wrapper_read(ctx->fd_input_wrapper, buf, buf_size);
 }
 
-static int64_t avio_seek_callback(void *opaque, int64_t offset, int whence) {
+static int64_t avio_seek_fd_callback(void *opaque, int64_t offset, int whence) {
   FfmpegDemuxContext *ctx = (FfmpegDemuxContext *) opaque;
-  return input_wrapper_seek(ctx->input_wrapper, offset, whence);
+  return fd_input_wrapper_seek(ctx->fd_input_wrapper, offset, whence);
 }
 
 static void demux_context_free(FfmpegDemuxContext *ctx) {
@@ -186,11 +161,11 @@ static void demux_context_free(FfmpegDemuxContext *ctx) {
     ctx->avio_ctx = NULL;
   }
 
-  LOGD("demux_context_free: input_wrapper");
-  if (ctx->input_wrapper) {
-    input_wrapper_free(ctx->input_wrapper);
-    free(ctx->input_wrapper);
-    ctx->input_wrapper = NULL;
+  LOGD("demux_context_free: fd_input_wrapper");
+  if (ctx->fd_input_wrapper) {
+    fd_input_wrapper_free(ctx->fd_input_wrapper);
+    free(ctx->fd_input_wrapper);
+    ctx->fd_input_wrapper = NULL;
   }
 
   LOGD("demux_context_free: ctx");
@@ -198,9 +173,10 @@ static void demux_context_free(FfmpegDemuxContext *ctx) {
   LOGD("demux_context_free: done");
 }
 
-FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inputLength) {
-  if (!inputData || inputLength <= 0) {
-    LOGE("Invalid parameters for nativeCreateContext");
+FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContextFromFd, jint fd, jlong startOffset, jlong length) {
+  if (fd < 0 || length <= 0) {
+    LOGE("Invalid parameters for nativeCreateContextFromFd: fd=%d, length=%lld",
+         fd, (long long) length);
     return 0L;
   }
 
@@ -211,19 +187,20 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
   }
 
   ctx->audio_stream_index = -1;
-  ctx->input_wrapper = (InputWrapper *) calloc(1, sizeof(InputWrapper));
-  if (!ctx->input_wrapper) {
-    LOGE("Failed to allocate InputWrapper");
+  ctx->fd_input_wrapper = (FdInputWrapper *) calloc(1, sizeof(FdInputWrapper));
+  if (!ctx->fd_input_wrapper) {
+    LOGE("Failed to allocate FdInputWrapper");
     demux_context_free(ctx);
     return 0L;
   }
 
-  // Initialize input wrapper
-  if (input_wrapper_init(ctx->input_wrapper, env, inputData, inputLength) < 0) {
-    LOGE("Failed to initialize input wrapper");
-    demux_context_free(ctx);
-    return 0L;
-  }
+  ctx->fd_input_wrapper->fd = fd;
+  ctx->fd_input_wrapper->start_offset = (int64_t) startOffset;
+  ctx->fd_input_wrapper->length = (int64_t) length;
+  ctx->fd_input_wrapper->cur_pos = 0;
+
+  LOGD("nativeCreateContextFromFd: fd=%d, start_offset=%lld, length=%lld",
+       fd, (long long) startOffset, (long long) length);
 
   unsigned char *avio_buffer = (unsigned char *) av_malloc(AVIO_BUFFER_SIZE);
   if (!avio_buffer) {
@@ -232,15 +209,15 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
     return 0L;
   }
 
-  // Create AVIOContext
+  // Create AVIOContext with fd-based callbacks
   ctx->avio_ctx = avio_alloc_context(
       avio_buffer,
       AVIO_BUFFER_SIZE,
       0, // write_flag (0 for read-only)
       ctx,
-      avio_read_packet_callback,
+      avio_read_fd_callback,
       NULL, // write_packet
-      avio_seek_callback);
+      avio_seek_fd_callback);
 
   if (!ctx->avio_ctx) {
     LOGE("Failed to allocate AVIOContext");
@@ -262,26 +239,24 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
   ctx->format_ctx->flags |= AVFMT_FLAG_CUSTOM_IO;
 
   // Open input
-  LOGD("Opening input, skip_initial_bytes: %lld, format_probesize: %d",
-       ctx->format_ctx->skip_initial_bytes,
-       ctx->format_ctx->format_probesize);
+  LOGD("Opening input from fd, format_probesize: %d", ctx->format_ctx->format_probesize);
 
   int ret = avformat_open_input(&ctx->format_ctx, NULL, NULL, NULL);
   if (ret < 0) {
-    log_error("avformat_open_input", ret);
+    log_error("avformat_open_input (fd)", ret);
     demux_context_free(ctx);
     return 0L;
   }
 
   // Find stream info
-  LOGD("Finding stream info");
+  LOGD("Finding stream info (fd)");
   ret = avformat_find_stream_info(ctx->format_ctx, NULL);
   if (ret < 0) {
-    log_error("avformat_find_stream_info", ret);
+    log_error("avformat_find_stream_info (fd)", ret);
     demux_context_free(ctx);
     return 0L;
   }
-  LOGD("Stream info found");
+  LOGD("Stream info found (fd)");
 
   // Find first audio stream
   for (unsigned int i = 0; i < ctx->format_ctx->nb_streams; i++) {
@@ -293,16 +268,16 @@ FFMPEG_EXTRACTOR_FUNC(jlong, nativeCreateContext, jbyteArray inputData, jint inp
   }
 
   if (ctx->audio_stream_index == -1) {
-    LOGE("No audio stream found");
+    LOGE("No audio stream found (fd)");
     demux_context_free(ctx);
     return 0L;
   }
 
-  LOGD("Audio stream index: %d", ctx->audio_stream_index);
-  LOGD("Audio codec: %s", avcodec_get_name(ctx->audio_stream->codecpar->codec_id));
-  LOGD("Sample rate: %d", ctx->audio_stream->codecpar->sample_rate);
-  LOGD("Channels: %d", ctx->audio_stream->codecpar->channels);
-  LOGD("Bit rate: %lld", (long long) ctx->audio_stream->codecpar->bit_rate);
+  LOGD("Audio stream index (fd): %d", ctx->audio_stream_index);
+  LOGD("Audio codec (fd): %s", avcodec_get_name(ctx->audio_stream->codecpar->codec_id));
+  LOGD("Sample rate (fd): %d", ctx->audio_stream->codecpar->sample_rate);
+  LOGD("Channels (fd): %d", ctx->audio_stream->codecpar->channels);
+  LOGD("Bit rate (fd): %lld", (long long) ctx->audio_stream->codecpar->bit_rate);
 
   return (jlong) ctx;
 }
@@ -385,21 +360,23 @@ FFMPEG_EXTRACTOR_FUNC(jint, nativeReadPacket, jlong context, jbyteArray outputBu
   AVPacket packet;
   av_init_packet(&packet);
 
-  int ret = av_read_frame(ctx->format_ctx, &packet);
-  if (ret < 0) {
-    if (ret == AVERROR_EOF) {
-      LOGD("End of stream reached");
-    } else {
-      log_error("av_read_frame", ret);
+  // Loop to skip non-audio packets in native code, avoiding tight JNI round-trips
+  while (true) {
+    int ret = av_read_frame(ctx->format_ctx, &packet);
+    if (ret < 0) {
+      if (ret == AVERROR_EOF) {
+        LOGD("End of stream reached");
+      } else {
+        log_error("av_read_frame", ret);
+      }
+      av_packet_unref(&packet);
+      return ret;
+    }
+
+    if (packet.stream_index == ctx->audio_stream_index) {
+      break; // Found an audio packet
     }
     av_packet_unref(&packet);
-    return ret;
-  }
-
-  // Check if this is an audio packet from our stream
-  if (packet.stream_index != ctx->audio_stream_index) {
-    av_packet_unref(&packet);
-    return 0; // Skip non-audio packets
   }
 
   if (packet.size > outputBufferSize) {

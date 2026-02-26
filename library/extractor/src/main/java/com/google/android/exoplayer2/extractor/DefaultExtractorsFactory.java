@@ -18,6 +18,7 @@ package com.google.android.exoplayer2.extractor;
 import static com.google.android.exoplayer2.util.FileTypes.inferFileTypeFromResponseHeaders;
 import static com.google.android.exoplayer2.util.FileTypes.inferFileTypeFromUri;
 
+import android.content.Context;
 import android.net.Uri;
 import androidx.annotation.GuardedBy;
 import androidx.annotation.Nullable;
@@ -127,6 +128,7 @@ public final class DefaultExtractorsFactory implements ExtractorsFactory {
   private static final ExtensionLoader FFMPEG_EXTENSION_LOADER =
       new ExtensionLoader(DefaultExtractorsFactory::getFfmpegExtractorConstructor);
 
+  @Nullable private Context context;
   private boolean constantBitrateSeekingEnabled;
   private boolean constantBitrateSeekingAlwaysEnabled;
   private @AdtsExtractor.Flags int adtsFlags;
@@ -145,6 +147,20 @@ public final class DefaultExtractorsFactory implements ExtractorsFactory {
   public DefaultExtractorsFactory() {
     tsMode = TsExtractor.MODE_SINGLE_PMT;
     tsTimestampSearchBytes = TsExtractor.DEFAULT_TIMESTAMP_SEARCH_BYTES;
+  }
+
+  /**
+   * Sets the application context. When set, enables fd-based FFmpeg extraction for WMA files,
+   * allowing the FFmpeg extension to read directly from disk via {@code pread()} instead of
+   * buffering the entire file in memory.
+   *
+   * @param context The application context, or {@code null} to disable fd-based extraction.
+   * @return The factory, for convenience.
+   */
+  @CanIgnoreReturnValue
+  public synchronized DefaultExtractorsFactory setContext(@Nullable Context context) {
+    this.context = context != null ? context.getApplicationContext() : null;
+    return this;
   }
 
   /**
@@ -358,25 +374,26 @@ public final class DefaultExtractorsFactory implements ExtractorsFactory {
     @FileTypes.Type
     int responseHeadersInferredFileType = inferFileTypeFromResponseHeaders(responseHeaders);
     if (responseHeadersInferredFileType != FileTypes.UNKNOWN) {
-      addExtractorsForFileType(responseHeadersInferredFileType, extractors);
+      addExtractorsForFileType(responseHeadersInferredFileType, extractors, uri);
     }
 
     @FileTypes.Type int uriInferredFileType = inferFileTypeFromUri(uri);
     if (uriInferredFileType != FileTypes.UNKNOWN
         && uriInferredFileType != responseHeadersInferredFileType) {
-      addExtractorsForFileType(uriInferredFileType, extractors);
+      addExtractorsForFileType(uriInferredFileType, extractors, uri);
     }
 
     for (int fileType : DEFAULT_EXTRACTOR_ORDER) {
       if (fileType != responseHeadersInferredFileType && fileType != uriInferredFileType) {
-        addExtractorsForFileType(fileType, extractors);
+        addExtractorsForFileType(fileType, extractors, uri);
       }
     }
 
     return extractors.toArray(new Extractor[extractors.size()]);
   }
 
-  private void addExtractorsForFileType(@FileTypes.Type int fileType, List<Extractor> extractors) {
+  private void addExtractorsForFileType(
+      @FileTypes.Type int fileType, List<Extractor> extractors, Uri uri) {
     switch (fileType) {
       case FileTypes.AC3:
         extractors.add(new Ac3Extractor());
@@ -468,9 +485,12 @@ public final class DefaultExtractorsFactory implements ExtractorsFactory {
         extractors.add(new AviExtractor());
         break;
       case FileTypes.WMA:
-        @Nullable Extractor ffmpegExtractor = FFMPEG_EXTENSION_LOADER.getExtractor();
-        if (ffmpegExtractor != null) {
-          extractors.add(ffmpegExtractor);
+        if (context != null) {
+          @Nullable
+          Extractor ffmpegExtractor = FFMPEG_EXTENSION_LOADER.getExtractor(context, uri);
+          if (ffmpegExtractor != null) {
+            extractors.add(ffmpegExtractor);
+          }
         }
         break;
       case FileTypes.WEBVTT:
@@ -511,7 +531,7 @@ public final class DefaultExtractorsFactory implements ExtractorsFactory {
       throws ClassNotFoundException, NoSuchMethodException {
     return Class.forName("com.google.android.exoplayer2.ext.ffmpeg.FfmpegExtractor")
         .asSubclass(Extractor.class)
-        .getConstructor();
+        .getConstructor(Context.class, Uri.class);
   }
 
   private static final class ExtensionLoader {
